@@ -11,6 +11,10 @@ func KeyWithCF(cf string, key []byte) []byte {
 	return append([]byte(cf+"_"), key...)
 }
 
+func TruncateCFFromKey(cf string, key []byte) []byte {
+	return key[len(cf)+1:]
+}
+
 func GetCF(db *badger.DB, cf string, key []byte) (val []byte, err error) {
 	err = db.View(func(txn *badger.Txn) error {
 		val, err = GetCFFromTxn(txn, cf, key)

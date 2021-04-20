@@ -37,23 +37,75 @@ func NewServer(storage storage.Storage) *Server {
 
 // Raw API.
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
-	// Your Code Here (1).
-	return nil, nil
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	value, err := reader.GetCF(req.GetCf(), req.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &kvrpcpb.RawGetResponse{Value: value, NotFound: value == nil}, nil
 }
 
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
-	// Your Code Here (1).
-	return nil, nil
+	modify := storage.Modify{
+		Data: storage.Put{Key: req.Key, Value: req.Value, Cf: req.Cf},
+	}
+
+	err := server.storage.Write(req.Context, []storage.Modify{modify})
+	if err != nil {
+		return nil, err
+	}
+
+	return &kvrpcpb.RawPutResponse{}, nil
 }
 
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
-	// Your Code Here (1).
-	return nil, nil
+	modify := storage.Modify{
+		Data: storage.Delete{Key: req.Key, Cf: req.Cf},
+	}
+
+	err := server.storage.Write(req.Context, []storage.Modify{modify})
+	if err != nil {
+		return nil, err
+	}
+
+	return &kvrpcpb.RawDeleteResponse{}, nil
 }
 
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
-	// Your Code Here (1).
-	return nil, nil
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	iter := reader.IterCF(req.Cf)
+	defer iter.Close()
+
+	kvs := []*kvrpcpb.KvPair{}
+	for iter.Seek(req.StartKey); iter.Valid(); iter.Next() {
+		item := iter.Item()
+		value, err := item.ValueCopy(nil)
+		if err != nil {
+			return nil, err
+		}
+
+		kvs = append(kvs, &kvrpcpb.KvPair{
+			Key:   item.KeyCopy(nil),
+			Value: value,
+		})
+
+		if uint32(len(kvs)) == req.Limit {
+			break
+		}
+	}
+
+	return &kvrpcpb.RawScanResponse{Kvs: kvs}, nil
 }
 
 // Raft commands (tinykv <-> tinykv)

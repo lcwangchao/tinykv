@@ -164,8 +164,23 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	// Your Code Here (2A).
-	return nil
+
+	state, confState, _ := c.Storage.InitialState()
+	peers := c.peers
+	if len(c.peers) <= 0 {
+		peers = confState.Nodes
+	}
+
+	raft := Raft{
+		id:      c.ID,
+		Term:    state.Term,
+		Vote:    state.Vote,
+		RaftLog: newLog(c.Storage),
+		Prs:     make(map[uint64]*Progress, len(peers)),
+		State:   StateFollower,
+	}
+
+	return &raft
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
