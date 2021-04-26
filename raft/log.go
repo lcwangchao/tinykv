@@ -54,8 +54,6 @@ type RaftLog struct {
 	// the incoming unstable snapshot, if any.
 	// (Used in 2C)
 	pendingSnapshot *pb.Snapshot
-
-	// Your Data Here (2A).
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -194,13 +192,15 @@ func (l *RaftLog) Append(ents ...pb.Entry) uint64 {
 
 	if after == l.LastIndex() {
 		l.entries = append(l.entries, ents...)
-	} else {
+	} else if after >= l.offsetEntry.Index {
 		l.entries = append([]pb.Entry{}, l.entries[:after-offset]...)
 		l.entries = append(l.entries, ents...)
-	}
-
-	if l.stabled > after {
-		l.stabled = after
+		if l.stabled > after {
+			l.stabled = after
+		}
+	} else {
+		l.entries = ents[l.offsetEntry.Index-after:]
+		l.stabled = l.offsetEntry.Index
 	}
 
 	return l.LastIndex()
@@ -303,4 +303,31 @@ func (l *RaftLog) zeroTermOnErrCompacted(t uint64, err error) uint64 {
 	}
 	log.Panicf("unexpected error (%v)", err)
 	return 0
+}
+
+func (l *RaftLog) AppliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+
+	if l.committed < i || i < l.applied {
+		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
+	}
+	l.applied = i
+}
+
+func (l *RaftLog) StableTo(i, t uint64) {
+	if i > l.LastIndex() {
+		log.Panicf("out of range for idx: %d", i)
+	}
+
+	if l.matchTerm(i, t) {
+		l.stabled = i
+	}
+}
+
+func (l *RaftLog) StableSnapTo(i uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
+		l.pendingSnapshot = nil
+	}
 }

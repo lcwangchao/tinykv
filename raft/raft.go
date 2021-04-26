@@ -231,6 +231,10 @@ func newRaft(c *Config) *Raft {
 		electionTimeout:  c.ElectionTick,
 	}
 
+	if c.Applied > 0 {
+		raft.RaftLog.AppliedTo(c.Applied)
+	}
+
 	return &raft
 }
 
@@ -702,6 +706,33 @@ func (r *Raft) bcastAppend() {
 			continue
 		}
 		r.sendAppend(id)
+	}
+}
+
+func (r *Raft) SoftState() *SoftState {
+	return &SoftState{Lead: r.Lead, RaftState: r.State}
+}
+
+func (r *Raft) HardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
+func (r *Raft) Advance(rd Ready) {
+	if newApplied := rd.appliedCursor(); newApplied > 0 {
+		r.RaftLog.AppliedTo(newApplied)
+	}
+
+	if len(rd.Entries) > 0 {
+		e := rd.Entries[len(rd.Entries)-1]
+		r.RaftLog.StableTo(e.Index, e.Term)
+	}
+
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.StableSnapTo(rd.Snapshot.Metadata.Index)
 	}
 }
 
