@@ -46,6 +46,8 @@ type RaftLog struct {
 	// Everytime handling `Ready`, the unstabled logs will be included.
 	stabled uint64
 
+	offsetEntry pb.Entry
+
 	// all entries that have not yet compact.
 	entries []pb.Entry
 
@@ -81,22 +83,22 @@ func newLog(storage Storage) *RaftLog {
 		committed = hardState.Commit
 	}
 
-	entries := make([]pb.Entry, 1)
-	entries[0].Index = firstIndex - 1
-	entries[0].Term, _ = storage.Term(firstIndex - 1)
+	offsetEntry := pb.Entry{}
+	offsetEntry.Index = firstIndex - 1
+	offsetEntry.Term, _ = storage.Term(firstIndex - 1)
 
-	storageEntries, err := storage.Entries(firstIndex, lastIndex+1)
+	entries, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
 		log.Panicf("error to get storage entries, %s", err.Error())
 	}
-	entries = append(entries, storageEntries...)
 
 	return &RaftLog{
-		storage:   storage,
-		committed: committed,
-		applied:   applied,
-		stabled:   lastIndex,
-		entries:   entries,
+		storage:     storage,
+		committed:   committed,
+		applied:     applied,
+		stabled:     lastIndex,
+		offsetEntry: offsetEntry,
+		entries:     entries[:],
 	}
 }
 
@@ -104,36 +106,27 @@ func newLog(storage Storage) *RaftLog {
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
-	offset := l.entries[0].Index
+	offset := l.offsetEntry.Index
 	if l.applied > offset {
-		l.entries = l.entries[l.applied-1:]
-		l.entries[0] = pb.Entry{
-			Term:  l.entries[0].Term,
-			Index: l.entries[0].Index,
-		}
+		l.entries = l.entries[l.applied-offset:]
 	}
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	offset := l.entries[0].Index
-	stableLastIndex, err := l.storage.LastIndex()
-	if err != nil {
-		log.Panicf("error to get storage last index, %s", err.Error())
-	}
-
-	return l.entries[stableLastIndex-offset+1:]
+	offset := l.offsetEntry.Index
+	return l.entries[l.stabled-offset:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	offset := l.entries[0].Index
-	return l.entries[l.applied-offset+1 : l.committed-offset+1]
+	offset := l.offsetEntry.Index
+	return l.entries[l.applied-offset : l.committed-offset]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	return l.entries[0].Index + uint64(len(l.entries)) - 1
+	return l.offsetEntry.Index + uint64(len(l.entries))
 }
 
 func (l *RaftLog) LastTerm() uint64 {
@@ -146,14 +139,19 @@ func (l *RaftLog) LastTerm() uint64 {
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	offset := l.entries[0].Index
+	offset := l.offsetEntry.Index
 	if i < offset {
 		return 0, ErrCompacted
 	}
-	if int(i-offset) >= len(l.entries) {
+
+	if i == offset {
+		return l.offsetEntry.Term, nil
+	}
+
+	if int(i-offset) > len(l.entries) {
 		return 0, ErrUnavailable
 	}
-	return l.entries[i-offset].Term, nil
+	return l.entries[i-offset-1].Term, nil
 }
 
 // Slice returns a slice of log entries from lo through hi-1, inclusive.
@@ -162,7 +160,7 @@ func (l *RaftLog) Slice(lo, hi uint64) ([]pb.Entry, error) {
 		return nil, errors.Errorf("invalid slice %d > %d", lo, hi)
 	}
 
-	offset := l.entries[0].Index
+	offset := l.offsetEntry.Index
 	if lo <= offset {
 		return nil, ErrCompacted
 	}
@@ -175,7 +173,7 @@ func (l *RaftLog) Slice(lo, hi uint64) ([]pb.Entry, error) {
 		return nil, nil
 	}
 
-	return l.entries[lo-offset : hi-offset], nil
+	return l.entries[lo-offset-1 : hi-offset-1], nil
 }
 
 func (l *RaftLog) IsUpToDate(lasti, term uint64) bool {
@@ -187,6 +185,7 @@ func (l *RaftLog) Append(ents ...pb.Entry) uint64 {
 		return l.LastIndex()
 	}
 
+	offset := l.offsetEntry.Index
 	after := ents[0].Index - 1
 
 	if after < l.committed || after > l.LastIndex() {
@@ -196,8 +195,12 @@ func (l *RaftLog) Append(ents ...pb.Entry) uint64 {
 	if after == l.LastIndex() {
 		l.entries = append(l.entries, ents...)
 	} else {
-		l.entries = append([]pb.Entry{}, l.entries[:after+1]...)
+		l.entries = append([]pb.Entry{}, l.entries[:after-offset]...)
 		l.entries = append(l.entries, ents...)
+	}
+
+	if l.stabled > after {
+		l.stabled = after
 	}
 
 	return l.LastIndex()

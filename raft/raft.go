@@ -450,7 +450,7 @@ func (r *Raft) maybeCommit() bool {
 		indexes = append(indexes, prs.Match)
 	}
 
-	sort.SliceStable(indexes, func(i, j int) bool { return i > j })
+	sort.SliceStable(indexes, func(i, j int) bool { return indexes[i] > indexes[j] })
 	return r.RaftLog.MaybeCommit(indexes[len(r.Prs)/2], r.Term)
 }
 
