@@ -541,6 +541,21 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
 		return nil
+	case pb.MessageType_MsgPropose:
+		if len(m.Entries) == 0 {
+			log.Panicf("%x stepped empty MsgProp", r.id)
+		}
+
+		entriesForAppend := make([]pb.Entry, 0, len(m.Entries))
+		for _, entry := range m.Entries {
+			entriesForAppend = append(entriesForAppend, *entry)
+		}
+
+		if !r.appendEntry(entriesForAppend...) {
+			return ErrProposalDropped
+		}
+		r.bcastAppend()
+		return nil
 	case pb.MessageType_MsgHeartbeatResponse:
 		if pr.Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
