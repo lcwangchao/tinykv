@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
+
 	"github.com/Connor1996/badger"
 	"github.com/Connor1996/badger/y"
 	"github.com/golang/protobuf/proto"
@@ -307,7 +309,27 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+
+	for _, entry := range entries {
+		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry); err != nil {
+			return err
+		}
+	}
+
+	lastEntry := entries[len(entries)-1]
+	lastIndex := lastEntry.Index
+	lastTerm := lastEntry.Term
+
+	for i := lastIndex + 1; i <= ps.raftState.LastIndex; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	}
+
+	ps.raftState.LastIndex = lastEntry.Index
+	ps.raftState.LastTerm = lastTerm
+
 	return nil
 }
 
@@ -319,19 +341,115 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
+	if snapData.Region.Id != ps.region.Id {
+		return nil, errors.Errorf("mismatch region id %v != %v", snapData.Region.Id, ps.region.Id)
+	}
+
+	if ps.isInitialized() {
+		// we can only delete the old data when the peer is initialized.
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+	}
+
+	lastIndex := snapshot.Metadata.Index
+	lastTerm := snapshot.Metadata.Term
+
+	ps.raftState.LastIndex = snapshot.Metadata.Term
+	ps.raftState.LastTerm = lastIndex
+
+	ps.applyState.AppliedIndex = lastIndex
+	ps.applyState.TruncatedState.Index = lastIndex
+	ps.applyState.TruncatedState.Term = lastTerm
+
+	result := &ApplySnapResult{
+		PrevRegion: ps.region,
+		Region:     snapData.Region,
+	}
+
+	ps.clearExtraData(snapData.Region)
+	ps.region = snapData.Region
+
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+	meta.WriteRegionState(kvWB, ps.region, rspb.PeerState_Normal)
+
 	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	return result, nil
 }
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
-	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
-	return nil, nil
+	kvWB, raftWB := engine_util.WriteBatch{}, engine_util.WriteBatch{}
+
+	snapshot := ready.Snapshot
+	var applySnapshotResult *ApplySnapResult
+	if !raft.IsEmptySnap(&snapshot) {
+		r, err := ps.ApplySnapshot(&snapshot, &kvWB, &raftWB)
+		applySnapshotResult = r
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(ready.Entries) != 0 {
+		if err := ps.Append(ready.Entries, &raftWB); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(ready.CommittedEntries) != 0 {
+		for _, entry := range ready.CommittedEntries {
+			switch entry.EntryType {
+			case eraftpb.EntryType_EntryNormal:
+				if len(entry.Data) == 0 {
+					continue
+				}
+
+				cmd := raft_cmdpb.RaftCmdRequest{}
+				err := cmd.Unmarshal(entry.Data)
+				if err != nil {
+					return nil, err
+				}
+
+				for _, request := range cmd.Requests {
+					switch request.CmdType {
+					case raft_cmdpb.CmdType_Put:
+						put := request.GetPut()
+						kvWB.SetCF(put.GetCf(), put.GetKey(), put.GetValue())
+					case raft_cmdpb.CmdType_Delete:
+						del := request.GetDelete()
+						kvWB.DeleteCF(del.GetCf(), del.GetKey())
+					}
+				}
+			}
+		}
+
+		appliedIndex := ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
+		ps.applyState.AppliedIndex = appliedIndex
+		kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+	}
+
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	}
+
+	err := raftWB.WriteToDB(ps.Engines.Raft)
+	if err != nil {
+		return nil, err
+	}
+
+	err = kvWB.WriteToDB(ps.Engines.Kv)
+	if err != nil {
+		return nil, err
+	}
+
+	return applySnapshotResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {

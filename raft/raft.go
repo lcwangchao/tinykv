@@ -382,7 +382,8 @@ func (r *Raft) tickFollower() {
 	}
 
 	r.electionElapsed++
-	if r.electionElapsed > r.randomizedElectionTimeout {
+	if r.electionElapsed >= r.randomizedElectionTimeout {
+		r.electionElapsed = 0
 		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
 	}
 }
@@ -393,7 +394,8 @@ func (r *Raft) tickCandidate() {
 	}
 
 	r.electionElapsed++
-	if r.electionElapsed > r.randomizedElectionTimeout {
+	if r.electionElapsed >= r.randomizedElectionTimeout {
+		r.electionElapsed = 0
 		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
 	}
 }
@@ -403,6 +405,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.reset(term)
 	r.Lead = lead
 	r.State = StateFollower
+	log.Infof("%x became follower at term %d", r.id, r.Term)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -414,6 +417,7 @@ func (r *Raft) becomeCandidate() {
 	r.reset(r.Term + 1)
 	r.Vote = r.id
 	r.State = StateCandidate
+	log.Infof("%x became candidate at term %d", r.id, r.Term)
 }
 
 // becomeLeader transform this peer's state to leader

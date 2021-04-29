@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
@@ -42,7 +46,110 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
-	// Your Code Here (2B).
+
+	raftGroup := d.RaftGroup
+	if !raftGroup.HasReady() {
+		return
+	}
+
+	rd := raftGroup.Ready()
+	committedEntries := rd.CommittedEntries
+	messages := rd.Messages
+	d.peerStorage.SaveReadyState(&rd)
+	raftGroup.Advance(rd)
+
+	d.Send(d.ctx.trans, messages)
+	d.handlesProposals(committedEntries)
+}
+
+func (d *peerMsgHandler) handlesProposals(committedEntries []eraftpb.Entry) {
+	proposalIdx := 0
+	entryIdx := 0
+
+	for proposalIdx < len(d.proposals) && entryIdx < len(committedEntries) {
+		p := d.proposals[proposalIdx]
+		entry := committedEntries[entryIdx]
+
+		if entry.Index < p.index {
+			entryIdx++
+			continue
+		}
+
+		if entry.Index == p.index {
+			d.responseProposal(p, &entry)
+			proposalIdx++
+			entryIdx++
+		} else {
+			d.responseDropProposal(p)
+			proposalIdx++
+		}
+	}
+
+	d.proposals = d.proposals[proposalIdx:]
+}
+
+func (d *peerMsgHandler) responseDropProposal(p *proposal) {
+	p.cb.Done(ErrResp(errors.New("propose dropped")))
+}
+
+func (d *peerMsgHandler) responseDropProposals(proposals []*proposal) {
+	for _, p := range proposals {
+		d.responseDropProposal(p)
+	}
+}
+
+func (d *peerMsgHandler) responseProposal(p *proposal, entry *eraftpb.Entry) {
+	cb := p.cb
+	if p.term != entry.Term {
+		d.responseDropProposal(p)
+		return
+	}
+
+	cmd := raft_cmdpb.RaftCmdRequest{}
+	if err := cmd.Unmarshal(entry.Data); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	resp := newCmdResp()
+	for _, req := range cmd.Requests {
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Put:
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Put,
+				Put:     &raft_cmdpb.PutResponse{},
+			})
+		case raft_cmdpb.CmdType_Delete:
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Delete,
+				Delete:  &raft_cmdpb.DeleteResponse{},
+			})
+		case raft_cmdpb.CmdType_Get:
+			value, err := engine_util.GetCF(d.ctx.engine.Kv, req.Get.Cf, req.Get.Key)
+			if err != nil {
+				cb.Done(ErrResp(err))
+			}
+
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Get,
+				Get:     &raft_cmdpb.GetResponse{Value: value},
+			})
+		case raft_cmdpb.CmdType_Snap:
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Snap,
+				Snap: &raft_cmdpb.SnapResponse{
+					Region: d.Region(),
+				},
+			})
+			cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
+		default:
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Invalid,
+			})
+		}
+	}
+
+	cb.Done(resp)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -113,7 +220,45 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	// Your Code Here (2B).
+
+	data, err := msg.Marshal()
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	prevIndex := d.RaftGroup.Raft.RaftLog.LastIndex()
+	if err := d.RaftGroup.Propose(data); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	currentIndex := d.RaftGroup.Raft.RaftLog.LastIndex()
+	if currentIndex == prevIndex {
+		cb.Done(ErrResp(errors.Errorf("invalid propose")))
+		return
+	}
+
+	currentTerm, err := d.RaftGroup.Raft.RaftLog.Term(currentIndex)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	for i := len(d.proposals) - 1; i >= 0; i-- {
+		p := d.proposals[i]
+		if p.index < currentIndex {
+			d.responseDropProposals(d.proposals[i+1:])
+			d.proposals = d.proposals[:i+1]
+			break
+		}
+	}
+
+	d.proposals = append(d.proposals, &proposal{
+		index: currentIndex,
+		term:  currentTerm,
+		cb:    cb,
+	})
 }
 
 func (d *peerMsgHandler) onTick() {

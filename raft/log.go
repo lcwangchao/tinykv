@@ -317,11 +317,7 @@ func (l *RaftLog) AppliedTo(i uint64) {
 }
 
 func (l *RaftLog) StableTo(i, t uint64) {
-	if i > l.LastIndex() {
-		log.Panicf("out of range for idx: %d", i)
-	}
-
-	if l.matchTerm(i, t) {
+	if l.matchTerm(i, t) && i > l.stabled {
 		l.stabled = i
 	}
 }
